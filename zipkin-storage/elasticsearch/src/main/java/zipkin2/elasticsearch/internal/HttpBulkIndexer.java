@@ -18,12 +18,15 @@ package zipkin2.elasticsearch.internal;
 
 import com.squareup.moshi.JsonWriter;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.RejectedExecutionException;
 import okhttp3.HttpUrl;
 import okhttp3.MediaType;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okio.Buffer;
+import okio.BufferedSink;
 import okio.BufferedSource;
 import zipkin2.elasticsearch.ElasticsearchStorage;
 import zipkin2.elasticsearch.internal.client.HttpCall;
@@ -41,7 +44,8 @@ public final class HttpBulkIndexer {
   final boolean waitForRefresh;
 
   // Mutated for each call to add
-  final Buffer body = new Buffer();
+  final Buffer smallIndexBuffer = new Buffer();
+  final List<Buffer> indexBuffers = new ArrayList<>();
 
   public HttpBulkIndexer(String tag, ElasticsearchStorage es) {
     this.tag = tag;
@@ -68,17 +72,20 @@ public final class HttpBulkIndexer {
     }
   }
 
-  public <T> void add(String index, String typeName, T input, BulkIndexDocumentWriter<T> indexSupport) {
+  public <T> void add(String index, String typeName, T input, BulkIndexDocumentWriter<T> writer) {
     Buffer document = new Buffer();
-    String id = indexSupport.writeDocument(input, document);
-    writeIndexMetadata(index, typeName, id);
-    body.writeByte('\n');
-    body.write(document, document.size());
-    body.writeByte('\n');
+    String id = writer.writeDocument(input, document);
+    // special case for small documents such as auto-complete tags
+    Buffer indexBuffer = document.size() < 512 ? smallIndexBuffer : new Buffer();
+    writeIndexMetadata(indexBuffer, index, typeName, id);
+    indexBuffer.writeByte('\n');
+    indexBuffer.write(document, document.size());
+    indexBuffer.writeByte('\n');
+    if (indexBuffer != smallIndexBuffer) indexBuffers.add(indexBuffer);
   }
 
-  <T> void writeIndexMetadata(String index, String typeName, String id) {
-    JsonWriter jsonWriter = JsonWriter.of(body);
+  void writeIndexMetadata(Buffer indexBuffer, String index, String typeName, String id) {
+    JsonWriter jsonWriter = JsonWriter.of(indexBuffer);
     try {
       jsonWriter.beginObject();
       jsonWriter.name("index");
@@ -100,12 +107,39 @@ public final class HttpBulkIndexer {
     if (pipeline != null) urlBuilder.addQueryParameter("pipeline", pipeline);
     if (waitForRefresh) urlBuilder.addQueryParameter("refresh", "wait_for");
 
-    Request request = new Request.Builder()
-      .url(urlBuilder.build())
-      .tag(tag)
-      .post(RequestBody.create(APPLICATION_JSON, body.readByteString()))
-      .build();
+    RequestBody body = indexBuffers.isEmpty()
+      ? RequestBody.create(APPLICATION_JSON, smallIndexBuffer.readByteString())
+      : new ChainedRequestBody(smallIndexBuffer, indexBuffers);
 
+    Request request = new Request.Builder().url(urlBuilder.build()).tag(tag).post(body).build();
     return http.newCall(request, CheckForErrors.INSTANCE);
+  }
+
+  /** This avoids allocating a large byte array (by using poolable buffers instead). */
+  static final class ChainedRequestBody extends RequestBody {
+    final long contentLength;
+    final List<Buffer> buffers = new ArrayList<>();
+
+    ChainedRequestBody(Buffer header, List<Buffer> buffers) {
+      long contentLength = header.size();
+      if (contentLength != 0) this.buffers.add(header);
+      for (Buffer buffer : buffers) {
+        contentLength += buffer.size();
+        this.buffers.add(buffer);
+      }
+      this.contentLength = contentLength;
+    }
+
+    @Override public MediaType contentType() {
+      return APPLICATION_JSON;
+    }
+
+    @Override public long contentLength() {
+      return contentLength;
+    }
+
+    @Override public void writeTo(BufferedSink sink) throws IOException {
+      for (Buffer body : buffers) sink.write(body, body.size());
+    }
   }
 }
